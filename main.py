@@ -8,11 +8,144 @@ from flask import Flask, send_from_directory, url_for
 import threading
 import urllib.parse
 from dotenv import load_dotenv
-import os
 import time
 import concurrent.futures
+import json
+from datetime import datetime, timedelta
 
 load_dotenv()
+
+limits = {}
+limit_json = 'limits.json'
+
+LIMIT = 1.0 # gb
+
+def load_limits():
+    global limits
+    try:
+        if os.path.exists(limit_json):
+            with open(limit_json, 'r') as f:
+                limits = json.load(f)
+    except Exception as e:
+        print(e)
+        limits = {}
+
+def save_limits():
+    try:
+        with open(limit_json, 'w') as f:
+            json.dump(limits, f, indent=2)
+    except Exception as e:
+        print(e)
+
+def get_user_stats(user_id):
+    user_id = str(user_id)
+    day = datetime.now(datetime.timezone.utc).date().isoformat()
+    
+    if user_id not in limits:
+        limits[user_id] = {
+            'total': 0,
+            'size_total': 0.0,
+            'usedtoday': {},
+            'last_reset': day
+        }
+    
+    if day not in limits[user_id]['usedtoday']:
+        limits[user_id]['usedtoday'][day] = {
+            'downloads': 0,
+            'size_mb': 0.0
+        }
+    
+    usage = limits[user_id]['usedtoday']
+    day = datetime.now(datetime.timezone.utc).date()
+    for date_str in list(usage.keys()):
+        try:
+            date_obj = datetime.strptime(date_str, '%Y-%m-%d').date()
+            if (day - date_obj).days > 7:
+                del usage[date_str]
+        except:
+            pass
+    
+    return limits[user_id]
+
+def can_download(user_id, approx_mb_size=0):
+    stats = get_user_stats(user_id)
+    day = datetime.now(datetime.timezone.utc).date().isoformat()
+    
+    used = stats['usedtoday'].get(day, {'downloads': 0, 'size_mb': 0.0})
+    mb_used = used['size_mb']
+    gb_used = mb_used / 1024
+    
+    mb_limit = LIMIT * 1024
+    mb_left = mb_limit - mb_used
+    if approx_mb_size > mb_left:
+        return {
+            'can_download': False,
+            'used_gb': gb_used,
+            'limit_gb': LIMIT,
+            'mb_left': mb_left,
+            'approx_mb_size': approx_mb_size,
+            'reason': f"Quota exceeded! Used: {gb_used:.2f}GB/{LIMIT}GB. Remaining: {mb_left:.0f}MB. Need: {approx_mb_size:.0f}MB. Try again tomorrow."
+        }
+    
+    return {
+        'can_download': True,
+        'used_gb': gb_used,
+        'limit_gb': LIMIT,
+        'mb_left': mb_left,
+        'downloads_today': used['downloads']
+    }
+
+def save(user_id, file_size_mb):
+    user_id = str(user_id)
+    stats = get_user_stats(user_id)
+    day = datetime.now(datetime.timezone.utc).date().isoformat()
+    
+    stats['total'] += 1
+    stats['size_total'] += file_size_mb / 1024
+    
+    if day not in stats['usedtoday']:
+        stats['usedtoday'][day] = {'downloads': 0, 'size_mb': 0.0}
+    
+    stats['usedtoday'][day]['downloads'] += 1
+    stats['usedtoday'][day]['size_mb'] += file_size_mb
+    
+    save_limits()
+
+def approximate_file_size(info, format_id=None):
+    max_size_bytes = 0
+    
+    if format_id:
+        for fmt in info.get('formats', []):
+            if fmt.get('format_id') == format_id:
+                if fmt.get('filesize'):
+                    return fmt['filesize'] / (1024 * 1024)
+                elif fmt.get('filesize_approx'):
+                    return fmt['filesize_approx'] / (1024 * 1024)
+                break
+    
+    for fmt in info.get('formats', []):
+        if fmt.get('filesize'):
+            max_size_bytes = max(max_size_bytes, fmt['filesize'])
+        elif fmt.get('filesize_approx'):
+            max_size_bytes = max(max_size_bytes, fmt['filesize_approx'])
+    
+    if max_size_bytes == 0:
+        duration = info.get('duration', 0)
+        if duration > 0:
+            estimated_mb = duration / 60 * 1.5
+            return estimated_mb
+        else:
+            return 50
+    
+    return max_size_bytes / (1024 * 1024)
+
+def formatted(size_mb):
+    if size_mb >= 1024:
+        return f"{size_mb/1024:.2f}GB"
+    else:
+        return f"{size_mb:.0f}MB"
+
+load_limits()
 
 app = Flask(__name__)
 @app.route('/downloads/<filename>')
@@ -94,7 +227,6 @@ class ProgressTracker:
                 
                 if total_mb > 0:
                     emb.add_field(name="Size", value=f"{downloaded_mb:.1f} MB / {total_mb:.1f} MB", inline=True)
-
                 else:
                     emb.add_field(name="Downloaded", value=f"{downloaded_mb:.1f} MB", inline=True)
                 
@@ -219,6 +351,8 @@ async def download_yt(url, type, format_id, interaction, info):
             result = await loop.run_in_executor(executor, download_fs, url, type, format_id, progress_tracker, info)
         await asyncio.sleep(1)
         if result['success']:
+            save(interaction.user.id, result['size'])
+            
             emb = discord.Embed(
                 title="Download Completed!",
                 description=f"**{info['title']}**",
@@ -231,6 +365,12 @@ async def download_yt(url, type, format_id, interaction, info):
             emb.add_field(name="URL", value=result['download_url'], inline=False)
             emb.add_field(name="Filename", value=result['filename'], inline=False)
             emb.add_field(name="Attention!", value="File will be deleted after 24 hours", inline=False)
+            stats = get_user_stats(interaction.user.id)
+            day = datetime.now(datetime.timezone.utc).date().isoformat()
+            used = stats['usedtoday'].get(day, {'downloads': 0, 'size_mb': 0.0})
+            used_gb = used['size_mb'] / 1024
+            emb.add_field(name="Daily Usage", value=f"{used_gb:.2f}GB / {LIMIT}GB used", inline=False)
+            
             emb.set_image(url=info['thumbnail'])
             await interaction.edit_original_response(embed=emb, view=None)
         else:
@@ -252,6 +392,7 @@ async def download_yt(url, type, format_id, interaction, info):
 @client.tree.command()
 async def download(interaction: discord.Interaction, url: str):
     await interaction.response.defer()
+    
     try:
         ydl_opts = {'quiet': True, 'no_warnings': True}
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -262,60 +403,123 @@ async def download(interaction: discord.Interaction, url: str):
                 if fmt.get('vcodec') and fmt.get('vcodec') != 'none' and fmt.get('height'):
                     height = fmt.get('height')
                     if height and not any(f['height'] == height for f in vid_fmt):
-                        vid_fmt.append({'height': height,'format_id': fmt.get('format_id'),'ext': fmt.get('ext', 'mp4'),'fps': fmt.get('fps', ''),'filesize': fmt.get('filesize', 0)})
+                        vid_fmt.append({
+                            'height': height,
+                            'format_id': fmt.get('format_id'),
+                            'ext': fmt.get('ext', 'mp4'),
+                            'fps': fmt.get('fps', ''),
+                            'filesize': fmt.get('filesize', 0)
+                        })
             
             vid_fmt.sort(key=lambda x: x['height'], reverse=True)
+            audio_size = approximate_file_size(info)
+            
             emb = discord.Embed(
                 title="Choose Download Type",
                 description=f"**{info['title']}**\n Duration: {info.get('duration', 0) // 60}:{info.get('duration', 0) % 60:02d}",
                 color=discord.Color.random()
             )
-            emb.add_field(name="Audio", value="Downlod MP3", inline=False)
-            if vid_fmt:
-                quality = ", ".join([f"{fmt['height']}p" for fmt in vid_fmt[:5]])
-                emb.add_field(name="Available Videos", value=quality + ("..." if len(vid_fmt) > 5 else ""), inline=False)
+            user_stats = get_user_stats(interaction.user.id)
+            day = datetime.now(datetime.timezone.utc).date().isoformat()
+            used = user_stats['usedtoday'].get(day, {'downloads': 0, 'size_mb': 0.0})
+            used_gb = used['size_mb'] / 1024
+            remaining_gb = LIMIT - used_gb
             
+            usage_text = f"📊 Daily Usage: {used_gb:.2f}GB / {LIMIT}GB\n💾 Remaining: {remaining_gb:.2f}GB"
+            emb.add_field(name="Your Bandwidth", value=usage_text, inline=False)
+            audio_check = can_download(interaction.user.id, audio_size)
+            if audio_check['can_download']:
+                emb.add_field(name="Audio", value=f"Download MP3 (~{formatted(audio_size)})", inline=False)
+            else:
+                emb.add_field(name="Audio", value="❌ Not enough bandwidth", inline=False)
+            if vid_fmt:
+                video_options = []
+                for fmt in vid_fmt[:10]:
+                    video_size = approximate_file_size(info, fmt['format_id'])
+                    video_check = can_download(interaction.user.id, video_size)
+                    fps_text = f"@{fmt['fps']}fps" if fmt['fps'] else ""
+                    size_text = f"~{formatted(video_size)}"
+                    
+                    if video_check['can_download']:
+                        video_options.append(f"✅ {fmt['height']}p {fps_text} ({size_text})")
+                    else:
+                        video_options.append(f"❌ {fmt['height']}p {fps_text} ({size_text}) - Not enough bandwidth")
+                
+                video_text = "\n".join(video_options)
+                if len(vid_fmt) > 10:
+                    video_text += "\n... and more"
+                emb.add_field(name="Available Videos", value=video_text, inline=False)
             
             emb.set_image(url=info['thumbnail'])
             view = discord.ui.View(timeout=300)
-            audio_button = discord.ui.Button(label="Audio", style=discord.ButtonStyle.primary)
-            
-            async def audio_callback(button):
-                await button.response.defer()
-                emb = discord.Embed(
-                    title="Starting Download...",
-                    description=f"**{info['title']}**\nPreparing audio download...",
-                    color=discord.Color.random()
-                )
-                await button.edit_original_response(embed=emb, view=None)
-                await download_yt(url, "audio", None, button, info)
-            audio_button.callback = audio_callback
-            view.add_item(audio_button)
-            if vid_fmt:
-                video_button = discord.ui.Button(label="Video",style=discord.ButtonStyle.primary)
+            if audio_check['can_download']:
+                audio_button = discord.ui.Button(label=f"Audio (~{formatted(audio_size)})", style=discord.ButtonStyle.primary)
+                
+                async def audio_callback(button):
+                    final_check = can_download(interaction.user.id, audio_size)
+                    if not final_check['can_download']:
+                        error_emb = discord.Embed(
+                            title="❌ Cannot Download",
+                            description=final_check['reason'],
+                            color=discord.Color.random()
+                        )
+                        await button.response.edit_message(embed=error_emb, view=None)
+                        return
+                    
+                    await button.response.defer()
+                    emb = discord.Embed(
+                        title="Starting Download...",
+                        description=f"**{info['title']}**\nPreparing audio download...",
+                        color=discord.Color.random()
+                    )
+                    await button.edit_original_response(embed=emb, view=None)
+                    await download_yt(url, "audio", None, button, info)
+                
+                audio_button.callback = audio_callback
+                view.add_item(audio_button)
+            if vid_fmt and any(can_download(interaction.user.id, approximate_file_size(info, fmt['format_id']))['can_download'] for fmt in vid_fmt):
+                video_button = discord.ui.Button(label="Video", style=discord.ButtonStyle.primary)
+                
                 async def video_callback(button):
                     quality_view = discord.ui.View(timeout=300)
-                    for i, fmt in enumerate(vid_fmt[:5]):
-                        fps_text = f" @{fmt['fps']}fps" if fmt['fps'] else ""
-                        quality_btn = discord.ui.Button(
-                            label=f"{fmt['height']}p{fps_text}",
-                            style=discord.ButtonStyle.secondary
-                        )
+                    
+                    for fmt in vid_fmt[:10]:
+                        video_size = approximate_file_size(info, fmt['format_id'])
+                        video_check = can_download(interaction.user.id, video_size)
                         
-                        def make_video_callback(format_id, height):
-                            async def quality_callback(interaction):
-                                await interaction.response.defer()
-                                emb = discord.Embed(
-                                    title="Starting Download....",
-                                    description=f"**{info['title']}**\nPreparing {height}p video download....",
-                                    color=discord.Color.random()
-                                )
-                                await interaction.edit_original_response(embed=emb, view=None)
-                                await download_yt(url, "video", format_id, interaction, info)
-                            return quality_callback
-                        
-                        quality_btn.callback = make_video_callback(fmt['format_id'], fmt['height'])
-                        quality_view.add_item(quality_btn)
+                        if video_check['can_download']:
+                            fps_text = f" @{fmt['fps']}fps" if fmt['fps'] else ""
+                            size_text = f" (~{formatted(video_size)})"
+                            quality_btn = discord.ui.Button(
+                                label=f"{fmt['height']}p{fps_text}{size_text}",
+                                style=discord.ButtonStyle.secondary
+                            )
+                            
+                            def make_video_callback(format_id, height, size):
+                                async def quality_callback(interaction):
+                                    final_check = can_download(interaction.user.id, size)
+                                    if not final_check['can_download']:
+                                        error_emb = discord.Embed(
+                                            title="❌ Cannot Download",
+                                            description=final_check['reason'],
+                                            color=discord.Color.random()
+                                        )
+                                        await interaction.response.edit_message(embed=error_emb, view=None)
+                                        return
+                                    
+                                    await interaction.response.defer()
+                                    emb = discord.Embed(
+                                        title="Starting Download....",
+                                        description=f"**{info['title']}**\nPreparing {height}p video download....",
+                                        color=discord.Color.random()
+                                    )
+                                    await interaction.edit_original_response(embed=emb, view=None)
+                                    await download_yt(url, "video", format_id, interaction, info)
+                                return quality_callback
+                            
+                            quality_btn.callback = make_video_callback(fmt['format_id'], fmt['height'], video_size)
+                            quality_view.add_item(quality_btn)
+                    
                     back_btn = discord.ui.Button(label="← Back", style=discord.ButtonStyle.secondary)
                     async def back_callback(interaction):
                         await interaction.response.edit_message(embed=emb, view=view)
@@ -324,7 +528,7 @@ async def download(interaction: discord.Interaction, url: str):
                     
                     emb = discord.Embed(
                         title="Choose Video Quality",
-                        description=f"**{info['title']}**\nSelect video quality:",
+                        description=f"**{info['title']}**\nSelect video quality (with size estimates):",
                         color=discord.Color.random()
                     )
                     await button.response.edit_message(embed=emb, view=quality_view)
@@ -341,5 +545,71 @@ async def download(interaction: discord.Interaction, url: str):
             color=discord.Color.random()
         )
         await interaction.followup.send(embed=emb)
+
+@client.tree.command()
+async def usage(interaction: discord.Interaction):
+    user_stats = get_user_stats(interaction.user.id)
+    day = datetime.now(datetime.timezone.utc).date().isoformat()
+    used = user_stats['usedtoday'].get(day, {'downloads': 0, 'size_mb': 0.0})
+    
+    used_gb = used['size_mb'] / 1024
+    remaining_gb = LIMIT - used_gb
+    percentage = (used_gb / LIMIT) * 100
+    
+    emb = discord.Embed(
+        title="📊 Your Daily Bandwidth Usage",
+        color=discord.Color.random()
+    )
+    
+    filled = int(20 * percentage / 100)
+    bar = '█' * filled + '░' * (20 - filled)
+    progress_text = f"```[{bar}] {percentage:.1f}%```"
+    
+    emb.add_field(name="Daily Progress", value=progress_text, inline=False)
+    emb.add_field(name="Used Today", value=f"{used_gb:.2f}GB", inline=True)
+    emb.add_field(name="Remaining", value=f"{remaining_gb:.2f}GB", inline=True)
+    emb.add_field(name="Downloads Today", value=str(used['downloads']), inline=True)
+    emb.add_field(name="Total Downloads", value=str(user_stats['total']), inline=True)
+    emb.add_field(name="Total Downloaded", value=f"{user_stats['size_total']:.2f}GB", inline=True)
+    emb.add_field(
+        name="Current Limits", 
+        value=f"• {LIMIT}GB daily bandwidth\n• No single file size limit\n• All video qualities available", 
+        inline=False
+    )
+    
+    emb.add_field(name="Reset Time", value="Bandwidth resets daily at midnight UTC", inline=False)
+    
+    await interaction.response.send_message(embed=emb)
+
+@client.tree.command()
+async def limits(interaction: discord.Interaction):
+    emb = discord.Embed(
+        title="📋 Download Limits & Information",
+        description="Current system limits:",
+        color=discord.Color.random()
+    )
+    
+    limits_text = f"""
+    📊 **Daily Bandwidth:** {LIMIT}GB per day
+    📦 **Single File Size:** No limit! Download files of any size
+    🎥 **Video Quality:** All qualities available (8K, 4K, 1080p, 720p, etc.)
+    🎵 **Audio Format:** MP3
+    ⏰ **Reset Time:** Daily at midnight UTC
+    """
+    
+    emb.add_field(name="Limits", value=limits_text, inline=False)
+    
+    examples_text = f"""
+    📝 **Examples:**
+    • 10 videos of 500MB each = 5GB (full daily limit)
+    • 1 video of 3GB + smaller videos = 5GB total
+    • 1 massive 5GB 8K video = full daily limit
+    • Mix any file sizes as long as total ≤ 5GB per day
+    """
+    
+    emb.add_field(name="How it Works", value=examples_text, inline=False)
+    emb.add_field(name="File Retention", value="Downloaded files are automatically deleted after 24 hours", inline=False)
+    
+    await interaction.response.send_message(embed=emb)
 
 client.run(os.getenv('TOKEN'))
