@@ -145,7 +145,7 @@ def download_file(filename):
     return send_from_directory('downloads', filename)
 
 def run_flask():
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    app.run(host='0.0.0.0', port=8184, debug=False)
 thread = threading.Thread(target=run_flask, daemon=True)
 thread.start()
 
@@ -387,7 +387,8 @@ def download_fs(url, type, format_id, progress_tracker, info, max_size_mb=None):
         else:
             ydl_opts = {
                 **base_opts,
-                'format': format_id,
+                'format': f'{format_id}+bestaudio/best',
+                'merge_output_format': 'mp4',
                 'outtmpl': f'downloads/{timestamp}_%(title)s_%(height)sp.%(ext)s'
             }
             ext = '.mp4'
@@ -409,7 +410,8 @@ def download_fs(url, type, format_id, progress_tracker, info, max_size_mb=None):
             ])
         else:
             cmd.extend([
-                '--format', format_id,
+                '--format', f'{format_id}+bestaudio/best',
+                '--merge-output-format', 'mp4',
                 '--output', f'downloads/{timestamp}_%(title)s_%(height)sp.%(ext)s'
             ])
         
@@ -511,7 +513,7 @@ def download_fs(url, type, format_id, progress_tracker, info, max_size_mb=None):
         
         file_created[file_path] = time.time()
         encoded = urllib.parse.quote(filename)
-        download_url = f"http://localhost:5000/downloads/{encoded}"
+        download_url = f"http://34.132.4.225:8184/downloads/{encoded}"
         
         return {
             'success': True,
@@ -781,7 +783,7 @@ async def download_search(interaction, url):
                 
                 async def audio_callback(button):
                     await button.response.defer()
-                    await download_yt(url, "audio", None, button, info, max_size_mb=mb_left)
+                    await download_yt(url, "audio", None, interaction, info, max_size_mb=mb_left)
                 
                 audio_button.callback = audio_callback
                 view.add_item(audio_button)
@@ -971,7 +973,7 @@ async def download(interaction: discord.Interaction, url: str):
                 
                 async def audio_callback(button):
                     await button.response.defer()
-                    await download_yt(url, "audio", None, button, info, max_size_mb=mb_left)
+                    await download_yt(url, "audio", None, interaction, info, max_size_mb=mb_left)
                 
                 audio_button.callback = audio_callback
                 view.add_item(audio_button)
@@ -1099,4 +1101,14 @@ async def show_limits(interaction: discord.Interaction):
     
     await interaction.response.send_message(embed=emb)
 
-client.run(os.getenv('TOKEN'))
+# Get Discord token from environment variables
+DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
+if not DISCORD_TOKEN:
+    print("Error: DISCORD_TOKEN environment variable not set!")
+    exit(1)
+
+client.run(DISCORD_TOKEN)
+
+
+
+
